@@ -9,14 +9,17 @@ constexpr uint8_t BOOT_BUTTON_PIN = 0;
 constexpr uint16_t MIN_BLINK_DELAY = 50;
 constexpr uint16_t MAX_BLINK_DELAY = 1000;
 constexpr uint16_t BLINK_STEP = 100;
-
 constexpr uint16_t DEBOUNCE_TIME = 50;
+constexpr uint16_t LONG_PRESS_TIME = 1000;
 
 uint16_t blinkDelay = 200;
+bool alternativeMode = false;
 
 uint8_t externalLastReading = HIGH;
 uint8_t externalStableState = HIGH;
 unsigned long externalLastDebounceTime = 0;
+unsigned long externalPressStartTime = 0;
+bool externalLongPressHandled = false;
 
 uint8_t bootLastReading = HIGH;
 uint8_t bootStableState = HIGH;
@@ -50,6 +53,7 @@ void initHardware() {
 
   digitalWrite(RED_LED_PIN, LOW);
   digitalWrite(BLUE_LED_PIN, LOW);
+  
   pinMode(EXTERN_BUTTON_PIN, INPUT_PULLUP);
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 }
@@ -102,8 +106,30 @@ bool wasButtonPressed(
       stableState = currentReading;
 
       if (stableState == LOW) {
+        if (pin == EXTERN_BUTTON_PIN) {
+          externalPressStartTime = millis();
+          externalLongPressHandled = false;
+        } else {
+          return true;
+        }
+      } else if (
+        pin == EXTERN_BUTTON_PIN
+        && !externalLongPressHandled
+      ) {
         return true;
       }
+    }
+
+    if (
+      pin == EXTERN_BUTTON_PIN
+      && stableState == LOW
+      && !externalLongPressHandled
+      && millis() - externalPressStartTime >= LONG_PRESS_TIME
+    ) {
+      alternativeMode = !alternativeMode;
+      externalLongPressHandled = true;
+
+      Serial.printf("Alternative mode: %s\n", alternativeMode ? "ON" : "OFF");
     }
   }
 
@@ -115,7 +141,7 @@ void handleBlinking() {
     ledState = !ledState;
 
     digitalWrite(RED_LED_PIN, ledState);
-    digitalWrite(BLUE_LED_PIN, ledState);
+    digitalWrite(BLUE_LED_PIN, alternativeMode ? !ledState : ledState);
 
     lastBlinkTime = millis();
   }
