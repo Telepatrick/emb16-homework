@@ -1,18 +1,39 @@
 #include <Arduino.h>
 
-// put function declarations here:
-int myFunction(int, int);
+constexpr uint8_t BUTTON_PIN = 15;
+
+constexpr unsigned long DEBOUNCE_DELAY = 0;
+
+int16_t buttonCounter = 0;
+
+bool lastReading = HIGH;
+bool stableState = HIGH;
+
+unsigned long lastDebounceTime = 0;
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
+  bool currentReading = digitalRead(BUTTON_PIN);
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  if (currentReading != lastReading) {
+    lastDebounceTime = millis();
+  }
+
+  if (millis() - lastDebounceTime >= DEBOUNCE_DELAY) {
+    if (currentReading != stableState) {
+      stableState = currentReading;
+
+      if (stableState == LOW) {
+        buttonCounter++;
+
+        Serial.printf("Button Pressed! Count: %d\n",buttonCounter);
+      }
+    }
+  }
+
+  lastReading = currentReading;
 }
