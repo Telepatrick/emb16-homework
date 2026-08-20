@@ -43,15 +43,14 @@ void setup()
     attachInterrupt(
         digitalPinToInterrupt(CONTACT_PIN),
         contactISR,
-        RISING);
+        RISING
+    );
 
     relayOffTime = millis();
 
-    Serial.println(
-        "| Measurement | Response time (ms)|");
+    Serial.println("| Measurement | Response time (ms)|");
 
-    Serial.println(
-        "|   :---:     |       :---:       |");
+    Serial.println("|   :---:     |       :---:       |");
 }
 
 void startMeasurement()
