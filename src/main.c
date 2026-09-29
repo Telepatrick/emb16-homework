@@ -1,106 +1,241 @@
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
+#include <stdbool.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "driver/ledc.h"
-#include "esp_adc/adc_oneshot.h"
+#include "driver/pulse_cnt.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
 
-static const char *TAG = "SERVO_LEDC";
+#define PIN_ENC_A GPIO_NUM_9
+#define PIN_ENC_B GPIO_NUM_10
+#define PIN_ENC_SW GPIO_NUM_11
+#define PIN_SERVO_PWM GPIO_NUM_18
+#define PIN_BUZZER_PWM GPIO_NUM_5
 
-#define SERVO_PIN 18
-#define ADC1_CHAN ADC_CHANNEL_3
+#define PWM_TIMER_SERVO LEDC_TIMER_0
+#define PWM_CHAN_SERVO LEDC_CHANNEL_0
+#define PWM_TIMER_BUZZER LEDC_TIMER_1
+#define PWM_CHAN_BUZZER LEDC_CHANNEL_1
 
-#define SERVO_MODE LEDC_LOW_SPEED_MODE
-#define SERVO_CHANNEL LEDC_CHANNEL_0
-#define SERVO_TIMER LEDC_TIMER_0
-#define SERVO_FREQ 50
-#define SERVO_RESOLUTION LEDC_TIMER_13_BIT
+#define ANGLE_MIN_VAL 0
+#define ANGLE_MAX_VAL 180
+#define ANGLE_MID_VAL 90
 
-#define MIN_PULSE_US 1000
-#define MAX_PULSE_US 2000
-#define PERIOD_US 20000
+#define SERVO_PULSE_MIN_US 500
+#define SERVO_PULSE_MAX_US 2500
+#define SERVO_PWM_PERIOD_US 20000
 
-#define ADC_DEADBAND_LOW 50
-#define ADC_MAX_VAL_FOR_180_DEG 2730
+#define BEEP_FREQ_HZ 2500
+#define BEEP_TIME_MS 100
+#define HOLD_TIME_MS 800
+#define DEBOUNCE_MS 40
+#define DEFAULT_STEP 10.0f
 
-static adc_oneshot_unit_handle_t adc1_handle;
+typedef struct {
+    float current_angle;
+    bool fine_step;
+    pcnt_unit_handle_t pcnt_unit;
+    esp_timer_handle_t timer_beep;
+} app_ctx_t;
 
-static void setup_servo_ledc(void) {
-    ledc_timer_config_t timer_conf = {
-        .speed_mode = SERVO_MODE,
-        .duty_resolution = SERVO_RESOLUTION,
-        .timer_num = SERVO_TIMER,
-        .freq_hz = SERVO_FREQ,
+static app_ctx_t g_ctx = {
+    .current_angle = ANGLE_MID_VAL,
+    .fine_step = false,
+    .pcnt_unit = NULL,
+    .timer_beep = NULL
+};
+
+static void servo_write_angle(float deg)
+{
+    if (deg < ANGLE_MIN_VAL) deg = ANGLE_MIN_VAL;
+    if (deg > ANGLE_MAX_VAL) deg = ANGLE_MAX_VAL;
+    float pulse = SERVO_PULSE_MIN_US + (deg / (float)ANGLE_MAX_VAL) * (SERVO_PULSE_MAX_US - SERVO_PULSE_MIN_US);
+    uint32_t duty = (uint32_t)((pulse / SERVO_PWM_PERIOD_US) * 4095.0f);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_SERVO, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_SERVO);
+}
+
+static void beeper_stop_callback(void *arg)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_BUZZER, 0);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_BUZZER);
+}
+
+static void sound_alert(void)
+{
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_BUZZER, 512);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, PWM_CHAN_BUZZER);
+    esp_timer_stop(g_ctx.timer_beep);
+    esp_timer_start_once(g_ctx.timer_beep, BEEP_TIME_MS * 1000);
+}
+
+static void init_hw(void)
+{
+    pcnt_unit_config_t u_cfg = {
+        .high_limit = 30000,
+        .low_limit = -30000,
+        .flags.accum_count = true
+    };
+    pcnt_new_unit(&u_cfg, &g_ctx.pcnt_unit);
+
+    pcnt_channel_handle_t ch_a = NULL;
+    pcnt_channel_handle_t ch_b = NULL;
+
+    pcnt_chan_config_t c_cfg_a = {
+        .edge_gpio_num = PIN_ENC_A,
+        .level_gpio_num = PIN_ENC_B,
+    };
+    pcnt_new_channel(g_ctx.pcnt_unit, &c_cfg_a, &ch_a);
+
+    pcnt_chan_config_t c_cfg_b = {
+        .edge_gpio_num = PIN_ENC_B,
+        .level_gpio_num = PIN_ENC_A,
+    };
+    pcnt_new_channel(g_ctx.pcnt_unit, &c_cfg_b, &ch_b);
+
+    pcnt_channel_set_edge_action(ch_a, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_DECREASE);
+    pcnt_channel_set_level_action(ch_a, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    pcnt_channel_set_edge_action(ch_b, PCNT_CHANNEL_EDGE_ACTION_DECREASE, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    pcnt_channel_set_level_action(ch_b, PCNT_CHANNEL_LEVEL_ACTION_KEEP, PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+
+    pcnt_glitch_filter_config_t f_cfg = {
+        .max_glitch_ns = 2000,
+    };
+    pcnt_unit_set_glitch_filter(g_ctx.pcnt_unit, &f_cfg);
+    pcnt_unit_enable(g_ctx.pcnt_unit);
+    pcnt_unit_clear_count(g_ctx.pcnt_unit);
+    pcnt_unit_start(g_ctx.pcnt_unit);
+
+    ledc_timer_config_t t_servo = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_12_BIT,
+        .timer_num = PWM_TIMER_SERVO,
+        .freq_hz = 50,
         .clk_cfg = LEDC_AUTO_CLK
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+    ledc_timer_config(&t_servo);
 
-    ledc_channel_config_t channel_conf = {
-        .gpio_num = SERVO_PIN,
-        .speed_mode = SERVO_MODE,
-        .channel = SERVO_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = SERVO_TIMER,
+    ledc_channel_config_t c_servo = {
+        .gpio_num = PIN_SERVO_PWM,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = PWM_CHAN_SERVO,
+        .timer_sel = PWM_TIMER_SERVO,
         .duty = 0,
-        .hpoint = 0,
-        .flags = {.output_invert = 0}
+        .hpoint = 0
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+    ledc_channel_config(&c_servo);
+
+    ledc_timer_config_t t_buzzer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = PWM_TIMER_BUZZER,
+        .freq_hz = BEEP_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&t_buzzer);
+
+    ledc_channel_config_t c_buzzer = {
+        .gpio_num = PIN_BUZZER_PWM,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = PWM_CHAN_BUZZER,
+        .timer_sel = PWM_TIMER_BUZZER,
+        .duty = 0,
+        .hpoint = 0
+    };
+    ledc_channel_config(&c_buzzer);
+
+    esp_timer_create_args_t tmr_args = {
+        .callback = beeper_stop_callback,
+        .name = "beeper"
+    };
+    esp_timer_create(&tmr_args, &g_ctx.timer_beep);
 }
 
-static void setup_adc(void) {
-    adc_oneshot_unit_init_cfg_t init_config1 = {
-        .unit_id = ADC_UNIT_1,
+static void encoder_btn_worker(void *param)
+{
+    gpio_config_t g_cfg = {
+        .pin_bit_mask = (1ULL << PIN_ENC_SW),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    gpio_config(&g_cfg);
 
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten    = ADC_ATTEN_DB_12,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC1_CHAN, &config));
-}
-
-static void set_servo_angle_ledc(float angle) {
-    if (angle < 0.0f) angle = 0.0f;
-    if (angle > 180.0f) angle = 180.0f;
-
-    float pulse_us = MIN_PULSE_US + (angle / 180.0f) * (MAX_PULSE_US - MIN_PULSE_US);
-
-    uint32_t duty = (uint32_t)((pulse_us / (float)PERIOD_US) * (1 << SERVO_RESOLUTION));
-
-    ESP_ERROR_CHECK(ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(SERVO_MODE, SERVO_CHANNEL));
-}
-
-void app_main(void) {
-    setup_servo_ledc();
-    setup_adc();
-
-    ESP_LOGI(TAG, "LEDC та ADC ініціалізовано на чистому ESP-IDF");
-
-    int raw_adc = 0;
+    TickType_t t_down = 0;
+    bool active = false;
 
     while (1) {
-        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC1_CHAN, &raw_adc));
+        int val = gpio_get_level(PIN_ENC_SW);
+        
+        if (val == 0 && !active) {
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
-        int filtered_adc = raw_adc;
-        if (filtered_adc < ADC_DEADBAND_LOW) {
-            filtered_adc = 0;
-        } else {
-            filtered_adc -= ADC_DEADBAND_LOW;
+            if (gpio_get_level(PIN_ENC_SW) == 0) {
+                active = true;
+                t_down = xTaskGetTickCount();
+            }
+        } else if (val == 1 && active) {
+            vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+            if (gpio_get_level(PIN_ENC_SW) == 1) {
+                TickType_t elapsed = xTaskGetTickCount() - t_down;
+
+                if (pdTICKS_TO_MS(elapsed) >= HOLD_TIME_MS) {
+                    g_ctx.current_angle = ANGLE_MID_VAL;
+                    servo_write_angle(g_ctx.current_angle);
+                } else {
+                    g_ctx.fine_step = !g_ctx.fine_step;
+                }
+
+                active = false;
+            }
         }
 
-        if (filtered_adc > ADC_MAX_VAL_FOR_180_DEG) {
-            filtered_adc = ADC_MAX_VAL_FOR_180_DEG;
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+}
+
+void app_main(void)
+{
+    init_hw();
+
+    servo_write_angle(g_ctx.current_angle);
+
+    xTaskCreate(encoder_btn_worker, "btn_wrk", 2048, NULL, 5, NULL);
+
+    int last_cnt = 0;
+    int raw_cnt = 0;
+    int pulse_accumulator = 0;
+
+    while (1) {
+        pcnt_unit_get_count(g_ctx.pcnt_unit, &raw_cnt);
+        int diff = raw_cnt - last_cnt;
+
+        if (diff != 0) {
+            last_cnt = raw_cnt;
+            pulse_accumulator += diff;
+
+            int steps = pulse_accumulator / 4;
+            if (steps != 0) {
+                float step_size = g_ctx.fine_step ? (DEFAULT_STEP / 2.0f) : DEFAULT_STEP;
+                float target = g_ctx.current_angle + (steps * step_size);
+
+                if (target < ANGLE_MIN_VAL || target > ANGLE_MAX_VAL) {
+                    sound_alert();
+                }
+
+                if (target < ANGLE_MIN_VAL) target = ANGLE_MIN_VAL;
+                if (target > ANGLE_MAX_VAL) target = ANGLE_MAX_VAL;
+
+                g_ctx.current_angle = target;
+                servo_write_angle(g_ctx.current_angle);
+
+                pulse_accumulator -= (steps * 4);
+            }
         }
 
-        float angle = ((float)filtered_adc / (float)ADC_MAX_VAL_FOR_180_DEG) * 180.0f;
-
-        set_servo_angle_ledc(angle);
-
-        ESP_LOGI(TAG, "Кут відхилення: %.1f deg | RAW ADC: %d", angle, raw_adc);
-
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
