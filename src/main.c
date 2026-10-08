@@ -1,106 +1,93 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "driver/ledc.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_err.h"
+#include "driver/i2c_master.h"
 
-static const char *TAG = "SERVO_LEDC";
+#include "ssd1315.h"
+#include "ds1307.h"
+#include "bme280.h"
 
-#define SERVO_PIN 18
-#define ADC1_CHAN ADC_CHANNEL_3
+#define I2C_MASTER_SCL_IO 5
+#define I2C_MASTER_SDA_IO 4
 
-#define SERVO_MODE LEDC_LOW_SPEED_MODE
-#define SERVO_CHANNEL LEDC_CHANNEL_0
-#define SERVO_TIMER LEDC_TIMER_0
-#define SERVO_FREQ 50
-#define SERVO_RESOLUTION LEDC_TIMER_13_BIT
+static i2c_master_bus_handle_t bus_handle;
+static i2c_master_dev_handle_t ssd1315_handle;
+static i2c_master_dev_handle_t ds1307_handle;
+static i2c_master_dev_handle_t bme280_handle;
 
-#define MIN_PULSE_US 1000
-#define MAX_PULSE_US 2000
-#define PERIOD_US 20000
-
-#define ADC_DEADBAND_LOW 50
-#define ADC_MAX_VAL_FOR_180_DEG 2730
-
-static adc_oneshot_unit_handle_t adc1_handle;
-
-static void setup_servo_ledc(void) {
-    ledc_timer_config_t timer_conf = {
-        .speed_mode = SERVO_MODE,
-        .duty_resolution = SERVO_RESOLUTION,
-        .timer_num = SERVO_TIMER,
-        .freq_hz = SERVO_FREQ,
-        .clk_cfg = LEDC_AUTO_CLK
+static esp_err_t i2c_bus_init(void)
+{
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
-
-    ledc_channel_config_t channel_conf = {
-        .gpio_num = SERVO_PIN,
-        .speed_mode = SERVO_MODE,
-        .channel = SERVO_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = SERVO_TIMER,
-        .duty = 0,
-        .hpoint = 0,
-        .flags = {.output_invert = 0}
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+    return i2c_new_master_bus(&bus_config, &bus_handle);
 }
 
-static void setup_adc(void) {
-    adc_oneshot_unit_init_cfg_t init_config1 = {
-        .unit_id = ADC_UNIT_1,
+static esp_err_t register_i2c_devices(void)
+{
+    i2c_device_config_t ssd1315_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = SSD1315_I2C_ADDR,
+        .scl_speed_hz = 100000,
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &ssd1315_cfg, &ssd1315_handle));
 
-    adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten    = ADC_ATTEN_DB_12,
+    i2c_device_config_t ds1307_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = DS1307_I2C_ADDR,
+        .scl_speed_hz = 100000,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC1_CHAN, &config));
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &ds1307_cfg, &ds1307_handle));
+
+    i2c_device_config_t bme280_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BME280_I2C_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &bme280_cfg, &bme280_handle));
+
+    return ESP_OK;
 }
 
-static void set_servo_angle_ledc(float angle) {
-    if (angle < 0.0f) angle = 0.0f;
-    if (angle > 180.0f) angle = 180.0f;
+void app_main(void)
+{
+    ESP_ERROR_CHECK(i2c_bus_init());
+    ESP_ERROR_CHECK(register_i2c_devices());
 
-    float pulse_us = MIN_PULSE_US + (angle / 180.0f) * (MAX_PULSE_US - MIN_PULSE_US);
+    ssd1315_init(ssd1315_handle);
+    ssd1315_clear(ssd1315_handle); 
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    uint32_t duty = (uint32_t)((pulse_us / (float)PERIOD_US) * (1 << SERVO_RESOLUTION));
+    bme280_init(bme280_handle);
 
-    ESP_ERROR_CHECK(ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(SERVO_MODE, SERVO_CHANNEL));
-}
-
-void app_main(void) {
-    setup_servo_ledc();
-    setup_adc();
-
-    ESP_LOGI(TAG, "LEDC та ADC ініціалізовано на чистому ESP-IDF");
-
-    int raw_adc = 0;
+    rtc_time_t rtc_time;
+    float temp = 0.0f, press = 0.0f, hum = 0.0f;
+    char display_buf[64];
 
     while (1) {
-        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC1_CHAN, &raw_adc));
-
-        int filtered_adc = raw_adc;
-        if (filtered_adc < ADC_DEADBAND_LOW) {
-            filtered_adc = 0;
-        } else {
-            filtered_adc -= ADC_DEADBAND_LOW;
+        if (ds1307_get_time(ds1307_handle, &rtc_time) == ESP_OK) {
+            snprintf(display_buf, sizeof(display_buf), "TM:   %02d:%02d:%02d", 
+                    rtc_time.hours, rtc_time.minutes, rtc_time.seconds);
+            ssd1315_draw_string(ssd1315_handle, 0, 0, display_buf);
         }
 
-        if (filtered_adc > ADC_MAX_VAL_FOR_180_DEG) {
-            filtered_adc = ADC_MAX_VAL_FOR_180_DEG;
+        if (bme280_read_data(bme280_handle, &temp, &press, &hum) == ESP_OK) {
+            snprintf(display_buf, sizeof(display_buf), "TMP:   %-5.1f C ", temp);
+            ssd1315_draw_string(ssd1315_handle, 2, 0, display_buf);
+
+            snprintf(display_buf, sizeof(display_buf), "PRSS: %-5.1f hPa", press);
+            ssd1315_draw_string(ssd1315_handle, 4, 0, display_buf);
+
+            snprintf(display_buf, sizeof(display_buf), "HUM:   %-5.1f ", hum);
+            ssd1315_draw_string(ssd1315_handle, 6, 0, display_buf);
         }
 
-        float angle = ((float)filtered_adc / (float)ADC_MAX_VAL_FOR_180_DEG) * 180.0f;
-
-        set_servo_angle_ledc(angle);
-
-        ESP_LOGI(TAG, "Кут відхилення: %.1f deg | RAW ADC: %d", angle, raw_adc);
-
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
