@@ -1,91 +1,75 @@
 #include <stdio.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_err.h"
-#include "driver/i2c_master.h"
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
 
-#include "ssd1315.h"
-#include "ds1307.h"
-#include "bme280.h"
+static const char *TAG = "SPI_MASTER";
 
-#define I2C_MASTER_SCL_IO 5
-#define I2C_MASTER_SDA_IO 4
+#define PIN_NUM_MISO 13
+#define PIN_NUM_MOSI 11
+#define PIN_NUM_CLK  12
+#define PIN_NUM_CS   10
 
-static i2c_master_bus_handle_t bus_handle;
-static i2c_master_dev_handle_t ssd1315_handle;
-static i2c_master_dev_handle_t ds1307_handle;
-static i2c_master_dev_handle_t bme280_handle;
+typedef struct __attribute__((packed)) {
+    float temperature;
+    float pressure;
+    float humidity;
+} bme280_packet_t;
 
-static esp_err_t i2c_bus_init(void)
-{
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+void app_main(void) {
+    esp_err_t ret;
+    spi_device_handle_t spi;
+
+    spi_bus_config_t buscfg = {
+        .miso_io_num = PIN_NUM_MISO,
+        .mosi_io_num = PIN_NUM_MOSI,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
     };
-    return i2c_new_master_bus(&bus_config, &bus_handle);
-}
 
-static esp_err_t register_i2c_devices(void)
-{
-    i2c_device_config_t ssd1315_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = SSD1315_I2C_ADDR,
-        .scl_speed_hz = 100000,
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 1 * 1000 * 1000,
+        .mode = 0,
+        .spics_io_num = PIN_NUM_CS,
+        .queue_size = 1,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &ssd1315_cfg, &ssd1315_handle));
 
-    i2c_device_config_t ds1307_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = DS1307_I2C_ADDR,
-        .scl_speed_hz = 100000,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &ds1307_cfg, &ds1307_handle));
+    ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI Init error: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    i2c_device_config_t bme280_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = BME280_I2C_ADDR,
-        .scl_speed_hz = 100000,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &bme280_cfg, &bme280_handle));
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI device adding error: %s", esp_err_to_name(ret));
+        return;
+    }
 
-    return ESP_OK;
-}
+    bme280_packet_t rx_data;
 
-void app_main(void)
-{
-    ESP_ERROR_CHECK(i2c_bus_init());
-    ESP_ERROR_CHECK(register_i2c_devices());
-
-    ssd1315_init(ssd1315_handle);
-    ssd1315_clear(ssd1315_handle); 
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    bme280_init(bme280_handle);
-
-    rtc_time_t rtc_time;
-    float temp = 0.0f, press = 0.0f, hum = 0.0f;
-    char display_buf[64];
+    ESP_LOGI(TAG, "SPI Master initialized...");
 
     while (1) {
-        if (ds1307_get_time(ds1307_handle, &rtc_time) == ESP_OK) {
-            snprintf(display_buf, sizeof(display_buf), "TM:   %02d:%02d:%02d", 
-                    rtc_time.hours, rtc_time.minutes, rtc_time.seconds);
-            ssd1315_draw_string(ssd1315_handle, 0, 0, display_buf);
-        }
+        memset(&rx_data, 0, sizeof(rx_data));
 
-        if (bme280_read_data(bme280_handle, &temp, &press, &hum) == ESP_OK) {
-            snprintf(display_buf, sizeof(display_buf), "TMP:   %-5.1f C ", temp);
-            ssd1315_draw_string(ssd1315_handle, 2, 0, display_buf);
+        spi_transaction_t t = {
+            .length = sizeof(bme280_packet_t) * 8,
+            .rx_buffer = &rx_data,
+            .tx_buffer = NULL,
+        };
 
-            snprintf(display_buf, sizeof(display_buf), "PRSS: %-5.1f hPa", press);
-            ssd1315_draw_string(ssd1315_handle, 4, 0, display_buf);
-
-            snprintf(display_buf, sizeof(display_buf), "HUM:   %-5.1f ", hum);
-            ssd1315_draw_string(ssd1315_handle, 6, 0, display_buf);
+        ret = spi_device_transmit(spi, &t);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Temp: %.2f °C | Press: %.2f hPa | Hum: %.2f %%",
+                         rx_data.temperature, rx_data.pressure, rx_data.humidity);
+        } else {
+            ESP_LOGE(TAG, "SPI transmaission error: %s (код: 0x%x)", esp_err_to_name(ret), ret);
         }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
